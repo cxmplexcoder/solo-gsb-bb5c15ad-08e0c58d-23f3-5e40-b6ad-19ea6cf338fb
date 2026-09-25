@@ -308,6 +308,21 @@ def main() -> int:
     else:
         raise AssertionError("over-capacity reservation should be rejected")
 
+    # Cumulative admission: the peak combined reservation over a candidate's
+    # coverage (persisted windows + candidate) may not exceed capacity.
+    scheduler.create_maintenance_window(at(600), at(720), 5)
+    try:
+        scheduler.create_maintenance_window(at(660), at(780), 4)
+    except scheduler.SchedulerError:
+        pass
+    else:
+        raise AssertionError("overlapping peak 5+4 > 8 should be rejected")
+    assert len(scheduler.list_maintenance_windows()) == 2  # nothing persisted
+    # Peak exactly at capacity is allowed; touching endpoints never add.
+    scheduler.create_maintenance_window(at(660), at(780), 3)
+    scheduler.create_maintenance_window(at(780), at(900), 8)
+    assert len(scheduler.list_maintenance_windows()) == 4
+
     # 8-GPU job predicts [0,60); the 2-GPU reservation over [30,90) blocks it.
     submit("a", 8, 60, 1.0, iso(0))
     r = scheduler.run_batch(now=at(0))
@@ -331,8 +346,10 @@ def main() -> int:
     assert r["selection_order"] == ["J000001"], r["selection_order"]
     assert r["selected_jobs"][0]["max_maintenance_reserved_gpus"] == 3
 
-    # RUNNING jobs are never preempted by a newly created window.
-    scheduler.create_maintenance_window(at(0), at(60), 8)
+    # RUNNING jobs are never preempted by a newly created window. The new
+    # window's 5 plus the persisted touching 3s peak exactly at capacity
+    # (admissible), so the cluster is fully reserved over [0,60).
+    scheduler.create_maintenance_window(at(0), at(60), 5)
     assert scheduler.get_job("J000001")["status"] == "RUNNING"
     submit("d", 1, 10, 1.0, iso(0))
     blocked = scheduler.run_batch(now=at(0))

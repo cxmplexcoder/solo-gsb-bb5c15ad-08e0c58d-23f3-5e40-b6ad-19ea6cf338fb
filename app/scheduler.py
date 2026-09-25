@@ -258,6 +258,15 @@ Inputs with ``end_at <= start_at`` or a reservation outside
 ``0..cluster_gpus`` are rejected; RUNNING jobs are never preempted by a
 newly created window.
 
+Creation is also admitted cumulatively: inside the write transaction the
+candidate window is overlaid on the already-persisted ones and the peak
+combined reservation over the candidate's own half-open coverage is
+computed with the same sweep the scheduler uses at dispatch time
+(overlapping windows add, endpoint-touching ones do not). A peak
+exceeding the cluster's *current* capacity rejects the creation and
+nothing is persisted; a peak exactly equal to the capacity is
+admissible.
+
 A batch treats its reference instant (``now``) as every selected job's
 estimated start; with the job's existing ``duration_min`` its predicted
 run is the half-open interval ``[now, now + duration_min)``. Before each
@@ -1602,8 +1611,15 @@ def create_maintenance_window(
     """Persist a half-open ``[start, end)`` UTC GPU-maintenance window.
 
     Rejects an interval whose end is not later than its start and a
-    reservation outside ``0..cluster_gpus``. Existing RUNNING jobs are left
-    untouched: a window only constrains future dispatch, it never preempts.
+    reservation outside ``0..cluster_gpus``. Inside the write transaction
+    the candidate is overlaid on the already-persisted windows and the
+    peak combined reservation over the candidate's own half-open coverage
+    is computed with the same sweep used at dispatch time: a peak
+    exceeding the cluster's current capacity rejects the creation (the
+    transaction rolls back, so nothing is persisted), while a peak
+    exactly equal to the capacity is admissible. Existing RUNNING jobs
+    are left untouched: a window only constrains future dispatch, it
+    never preempts.
     """
     if not isinstance(reserved_gpus, int) or isinstance(reserved_gpus, bool):
         raise SchedulerError(
@@ -1624,6 +1640,23 @@ def create_maintenance_window(
     with db.get_lock(), db.get_conn():
         conn = db.get_conn()
         conn.execute("BEGIN IMMEDIATE")
+        # Cumulative admission, checked against the locked state so a
+        # concurrent creation cannot slip past it: over the candidate's
+        # own half-open coverage, its reservation adds to every persisted
+        # window overlapping the same instant (endpoint-touching windows
+        # never overlap, so they never add). Rejecting here rolls the
+        # transaction back: no row is written and no id is consumed.
+        peak = _peak_reserved_gpus(
+            _load_maintenance_windows(conn) + [(start, end, reserved_gpus)],
+            start,
+            end,
+        )
+        if peak > settings.cluster_gpus:
+            raise SchedulerError(
+                f"maintenance reservations over "
+                f"[{start.isoformat()}, {end.isoformat()}) peak at {peak} "
+                f"GPUs, exceeding cluster capacity {settings.cluster_gpus}"
+            )
         cur = conn.execute(
             """INSERT INTO maintenance_windows
                    (start_at, end_at, reserved_gpus, created_at)

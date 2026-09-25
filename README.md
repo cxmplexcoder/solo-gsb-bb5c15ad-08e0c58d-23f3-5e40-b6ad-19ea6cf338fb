@@ -335,6 +335,13 @@ curl -X POST http://localhost:8000/jobs/graph \
   `now` 与相同状态下选择顺序完全一致；预演不落库，已持久化的维护时段保持不变。
 - 校验：`end_at <= start_at` → 400；`reserved_gpus` 超出 `0..CLUSTER_GPUS` → 400
   （负整数/布尔等类型错误为 422）。允许预留 `0`（相当于占位、不影响调度）。
+- **累计预留校验**：创建时在**同一写事务**内把候选时段与已持久化时段按同一套 UTC
+  半开区间扫描叠加，计算候选覆盖期间 `[start_at, end_at)` 内「已有时段 + 候选时段」
+  的**预留峰值**；峰值**超过当前集群容量** → 400 且**不落库**（也不占用 id）。
+  与调度口径一致：**端点相接不累加**，峰值**恰好等于容量可以创建**。例如 8 GPU
+  集群先建 `[10:00,12:00)` 预留 5，再建 `[11:00,13:00)` 预留 4 会因重叠段
+  `[11:00,12:00)` 峰值 9 > 8 返回 400；改预留 3（峰值恰为 8）或建相接时段
+  `[12:00,14:00)` 预留 8 均可创建。
 - 维护时段与作业、租户、账本一样保存在 SQLite（`maintenance_windows` 表），随现有
   Docker Compose 的命名卷 `scheduler-data`（容器内 `/data/scheduler.db`）持久化，
   重建容器不丢；旧数据库启动时自动建表，无需手工迁移。
@@ -812,7 +819,7 @@ curl -X POST http://localhost:8000/maintenance-windows \
 |---|---|---|
 | `start_at` | 是 | 起始时刻（**UTC**，ISO-8601），含；不带时区偏移的时间戳按 UTC 解释 |
 | `end_at` | 是 | 结束时刻（**UTC**，ISO-8601），不含；**必须严格晚于 `start_at`，否则 400** |
-| `reserved_gpus` | 是 | 时段内预留 GPU 数，整数 `0..CLUSTER_GPUS`；超出集群容量 → 400，负数/布尔 → 422 |
+| `reserved_gpus` | 是 | 时段内预留 GPU 数，整数 `0..CLUSTER_GPUS`；单条超出集群容量 → 400，负数/布尔 → 422。另做**累计校验**：候选覆盖期间「已有时段 + 候选时段」的预留峰值超过当前容量同样 → 400 且不落库（端点相接不累加，峰值等于容量可创建） |
 
 查询全部维护时段（按开始时刻升序）：
 
@@ -929,7 +936,7 @@ curl -s -G localhost:8000/jobs/J000001/maintenance-slots \
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
 | GET | `/queue` | 每租户 FIFO 队列与位置 |
 | GET | `/usage/gpu` | **按 UTC 时间窗汇总**每租户/全局 GPU-分钟与重叠作业数（可选 `tenant_id`） |
-| POST | `/maintenance-windows` | 创建**持久化 GPU 维护时段**（UTC 半开区间 + 预留 GPU 数）；结束不晚于开始或预留超容量返回 400 |
+| POST | `/maintenance-windows` | 创建**持久化 GPU 维护时段**（UTC 半开区间 + 预留 GPU 数）；结束不晚于开始、单条预留超容量、或候选覆盖期间与已有时段的合计预留峰值超当前容量（写事务内校验，端点相接不累加、等于容量可创建）均返回 400 且不落库 |
 | GET | `/maintenance-windows` | 列出维护时段（可按 `active_at` UTC 时刻过滤活动时段） |
 | GET | `/ledger` | 信用/扣减审计流水 |
 | GET | `/health` | 健康检查（本机：<http://localhost:8000/health>） |
@@ -1052,8 +1059,8 @@ curl -s -X POST localhost:8000/scheduler/preview     # 新作业立即按现有�
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（215 个：服务层算法/依赖/批量作业图提交/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
-# 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/维护空档查询/POST /jobs 幂等提交（含容量下调后重试判定顺序）/依赖就绪老化 + HTTP 端到端）
+# 运行全部测试（220 个：服务层算法/依赖/批量作业图提交/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
+# 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段（含累计预留峰值校验）/维护空档查询/POST /jobs 幂等提交（含容量下调后重试判定顺序）/依赖就绪老化 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -1078,7 +1085,7 @@ tests/
   test_job_graph.py    # 批量作业图提交：顺序 id/ref 映射、前向与跨租户引用、同租户 weight 一致性、整图环路、整批回滚不改权重/队列、预演与批次立即生效
   test_budget.py       # 滚动 24h GPU-分钟预算：设置/保留/清除、超额阻塞、窗口滑动、不退费、预演不落库
   test_preview.py      # 预演测试：与正式批次决策一致、零写入、异常回滚
-  test_maintenance.py  # 维护时段：持久化/校验、重叠准入、端点相接、RUNNING 不抢占、预演一致
+  test_maintenance.py  # 维护时段：持久化/校验、创建时累计预留峰值校验（重叠累加、相接不累加、等于容量可创建、拒绝不落库）、重叠准入、端点相接、RUNNING 不抢占、预演一致
   test_maintenance_slots.py  # 维护空档查询：可行开始时刻区间合并、端点相接、孤立时刻、固定 RUNNING 基线、HTTP
   test_idempotency.py  # POST /jobs 幂等：首次/重试/409、失败不占 key、依赖规范化、租户隔离、并发与重启只建一个作业、重启后 CLUSTER_GPUS 下调时同参重试仍 200/异参仍 409/新 key 首次才按当前容量校验
   test_dependencies_revision.py  # 依赖修订：整体替换/清空、跨租户、QUEUED 限定、拒绝保持原依赖、预演与批次生效、幂等指纹保留
