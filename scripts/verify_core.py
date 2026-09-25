@@ -331,8 +331,11 @@ def main() -> int:
     assert r["selection_order"] == ["J000001"], r["selection_order"]
     assert r["selected_jobs"][0]["max_maintenance_reserved_gpus"] == 3
 
-    # RUNNING jobs are never preempted by a newly created window.
-    scheduler.create_maintenance_window(at(0), at(60), 8)
+    # RUNNING jobs are never preempted by a newly created window. The new
+    # window reserves 5 over [0,60): together with the two persisted 3-GPU
+    # windows the combined peak is exactly the cluster capacity (3+5=8), so
+    # the creation is admitted — and it still withholds every free GPU.
+    scheduler.create_maintenance_window(at(0), at(60), 5)
     assert scheduler.get_job("J000001")["status"] == "RUNNING"
     submit("d", 1, 10, 1.0, iso(0))
     blocked = scheduler.run_batch(now=at(0))
@@ -348,6 +351,24 @@ def main() -> int:
     assert p["selection_order"] == ["J000002"]
     assert db.get_conn().execute(
         "SELECT COUNT(*) AS n FROM batches").fetchone()["n"] == batches_before
+    assert len(scheduler.list_maintenance_windows()) == 3
+
+    # Cumulative creation check: a candidate whose addition would push the
+    # combined peak over the current cluster capacity is rejected (and not
+    # persisted); touching endpoints do not add, exact capacity is allowed.
+    db.reset_for_tests()
+    db.connect(":memory:")
+    scheduler.create_maintenance_window(at(10), at(12), 5)
+    try:
+        scheduler.create_maintenance_window(at(11), at(13), 4)  # peak 9 > 8
+    except scheduler.SchedulerError:
+        pass
+    else:
+        raise AssertionError(
+            "cumulative over-capacity window should be rejected")
+    assert len(scheduler.list_maintenance_windows()) == 1  # nothing persisted
+    scheduler.create_maintenance_window(at(12), at(14), 5)   # touching: OK
+    scheduler.create_maintenance_window(at(11), at(13), 3)   # peak 5+3=8: OK
     assert len(scheduler.list_maintenance_windows()) == 3
     print("case 10 maintenance windows admission/preview OK")
 

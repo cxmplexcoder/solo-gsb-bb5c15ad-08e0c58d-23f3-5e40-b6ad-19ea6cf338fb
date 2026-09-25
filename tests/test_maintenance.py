@@ -90,6 +90,68 @@ def test_naive_datetimes_treated_as_utc(conn):
 
 
 # ---------------------------------------------------------------------------
+# Cumulative reservation validation on creation
+# ---------------------------------------------------------------------------
+
+def test_overlapping_windows_cumulative_peak_rejected(conn):
+    # 8-GPU cluster: [10,12) reserves 5 -> created; [11,13) reserving 4 would
+    # peak at 5+4=9 over [11,12) -> 400 and nothing is persisted.
+    w = window(10, 12, 5)
+    with pytest.raises(scheduler.SchedulerError, match="cluster capacity"):
+        window(11, 13, 4)
+    assert [x["id"] for x in scheduler.list_maintenance_windows()] == [w["id"]]
+
+    # The rejected window left no trace in dispatch admission either: a
+    # 3-GPU job whose run [0,13) collides with the persisted window
+    # (3+5=8 <= 8) dispatches; had the 4-GPU window been stored it would
+    # have been blocked (peak 9).
+    submit("a", 3, 13, when=iso(0))
+    r = scheduler.run_batch(now=at(0))
+    assert r["selection_order"] == ["J000001"]
+    assert r["selected_jobs"][0]["max_maintenance_reserved_gpus"] == 5
+
+
+def test_cumulative_peak_exactly_at_capacity_allowed(conn):
+    window(10, 12, 5)
+    w2 = window(11, 13, 3)      # overlap [11,12): 5+3 = 8 = capacity -> OK
+    assert w2["id"] == 2
+    # One more GPU anywhere inside the overlap pushes the peak to 9.
+    with pytest.raises(scheduler.SchedulerError, match="cluster capacity"):
+        window(11, 12, 1)
+    assert len(scheduler.list_maintenance_windows()) == 2
+
+
+def test_touching_windows_do_not_accumulate_on_create(conn):
+    window(10, 12, 5)
+    window(12, 14, 5)           # touches at 12 -> no accumulation, peak 5
+    w3 = window(9, 10, 8)       # touches at 10 -> peak 8 = capacity, allowed
+    assert w3["reserved_gpus"] == 8
+    assert len(scheduler.list_maintenance_windows()) == 3
+
+
+def test_candidate_bridging_two_windows_rejected(conn):
+    # Two disjoint 5-GPU windows; a 4-GPU candidate overlapping either one
+    # peaks at 9 -> rejected, and a slimmer 3-GPU bridge (peak 8) is fine.
+    window(10, 12, 5)
+    window(14, 16, 5)
+    with pytest.raises(scheduler.SchedulerError, match="cluster capacity"):
+        window(11, 15, 4)
+    assert len(scheduler.list_maintenance_windows()) == 2
+    w = window(11, 15, 3)
+    assert w["reserved_gpus"] == 3
+    assert len(scheduler.list_maintenance_windows()) == 3
+
+
+def test_zero_reservation_candidate_against_full_reservation(conn):
+    window(10, 12, 8)           # whole cluster reserved
+    w = window(11, 13, 0)       # adds nothing -> peak stays 8, allowed
+    assert w["reserved_gpus"] == 0
+    with pytest.raises(scheduler.SchedulerError, match="cluster capacity"):
+        window(11, 13, 1)       # 8+1 = 9 -> rejected, not persisted
+    assert len(scheduler.list_maintenance_windows()) == 2
+
+
+# ---------------------------------------------------------------------------
 # Dispatch admission
 # ---------------------------------------------------------------------------
 
@@ -362,6 +424,41 @@ def test_maintenance_window_validation_http(client):
         "end_at": "2026-01-01T01:00:00Z",
         "reserved_gpus": 1}).status_code == 422
     assert client.get("/maintenance-windows").json() == []
+
+
+def test_maintenance_window_cumulative_validation_http(client):
+    # The task scenario on an 8-GPU cluster: [10:00,12:00) reserves 5 -> 201.
+    r = client.post("/maintenance-windows", json={
+        "start_at": "2026-01-01T10:00:00Z",
+        "end_at": "2026-01-01T12:00:00Z",
+        "reserved_gpus": 5})
+    assert r.status_code == 201, r.text
+
+    # [11:00,13:00) reserving 4 would peak at 9 over [11:00,12:00) -> 400,
+    # and nothing is persisted.
+    r2 = client.post("/maintenance-windows", json={
+        "start_at": "2026-01-01T11:00:00Z",
+        "end_at": "2026-01-01T13:00:00Z",
+        "reserved_gpus": 4})
+    assert r2.status_code == 400
+    assert "cluster capacity" in r2.json()["detail"]
+    assert [w["id"] for w in client.get("/maintenance-windows").json()] == [1]
+
+    # Endpoint-touching candidate does not accumulate -> 201.
+    r3 = client.post("/maintenance-windows", json={
+        "start_at": "2026-01-01T12:00:00Z",
+        "end_at": "2026-01-01T14:00:00Z",
+        "reserved_gpus": 5})
+    assert r3.status_code == 201, r3.text
+
+    # Peak exactly at capacity over [11:00,12:00) and [12:00,13:00): 5+3=8
+    # -> 201.
+    r4 = client.post("/maintenance-windows", json={
+        "start_at": "2026-01-01T11:00:00Z",
+        "end_at": "2026-01-01T13:00:00Z",
+        "reserved_gpus": 3})
+    assert r4.status_code == 201, r4.text
+    assert len(client.get("/maintenance-windows").json()) == 3
 
 
 def test_maintenance_blocks_dispatch_end_to_end_http(client):

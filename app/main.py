@@ -247,7 +247,11 @@ class MaintenanceWindowIn(BaseModel):
         ..., ge=0,
         description=(
             "GPUs withheld from scheduling throughout the half-open window. "
-            "Overlapping windows add; must not exceed cluster capacity."
+            "Overlapping windows add: creation is rejected when the combined "
+            "reservation of the existing windows plus this one would peak "
+            "above cluster capacity at any instant of this window (windows "
+            "merely touching at an endpoint do not add; a peak exactly equal "
+            "to capacity is allowed)."
         ),
         examples=[4],
     )
@@ -593,9 +597,12 @@ def create_maintenance_window(body: MaintenanceWindowIn):
 
     During ``[start_at, end_at)`` the given number of GPUs is reserved and
     withheld from dispatch (overlapping windows add; touching endpoints do
-    not overlap). Returns 400 when ``end_at`` is not later than ``start_at``
-    or the reservation exceeds cluster capacity. RUNNING jobs are never
-    preempted; only subsequent batch/preview dispatch respects the window.
+    not overlap). Returns 400 when ``end_at`` is not later than ``start_at``,
+    when the reservation exceeds cluster capacity, or when the combined
+    reservation of the existing windows plus this one would peak above the
+    current cluster capacity at any instant of this window — a rejected
+    window is never persisted. RUNNING jobs are never preempted; only
+    subsequent batch/preview dispatch respects the window.
     """
     try:
         return scheduler.create_maintenance_window(
